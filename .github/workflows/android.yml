@@ -12,12 +12,6 @@ jobs:
         run: |
           sed -i '1i #include <algorithm>' source/egg/math/Quat.hh
           grep -rl -- '-Werror' configure.py CMakeLists.txt 2>/dev/null | xargs -r sed -i 's/-Werror//g'
-          cat >> CMakeLists.txt << 'EOF'
-
-          add_executable(kinoko_cli source/host/main.cc)
-          target_link_libraries(kinoko_cli libkinoko)
-          set_target_properties(kinoko_cli PROPERTIES OUTPUT_NAME kinoko)
-          EOF
           cat > "$GITHUB_WORKSPACE/compat_android.hh" << 'EOF'
           #pragma once
           #include <version>
@@ -60,14 +54,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_STANDARD=23 \
             -DCMAKE_CXX_FLAGS="-include algorithm -include bit -include sstream -include $GITHUB_WORKSPACE/compat_android.hh -ferror-limit=0 -Wno-error -Wno-unknown-warning-option"
-          cmake --build build-android --target libkinoko kinoko_cli -- -k 0 2>&1 | tee build.log || true
+          cmake --build build-android -- -k 0 2>&1 | tee build.log || true
           echo "===== ERROR SUMMARY ====="
-          grep -E "error:|undefined|multiple definition" build.log | sed 's#/home/runner/work/Kinoko/Kinoko/##' | sort | uniq -c | sort -rn | head -40
+          grep -E "error:|undefined|multiple" build.log | sed 's#/home/runner/work/Kinoko/Kinoko/##' | sort | uniq -c | sort -rn | head -40
+          echo "===== RESULT ====="
           find build-android -name "*.a" -o -name "kinoko" -type f
+          test -n "$(find build-android -name kinoko -type f)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: kinoko-android
           path: |
             build-android/**/*.a
-            build-android/kinoko
+            build-android/**/kinoko

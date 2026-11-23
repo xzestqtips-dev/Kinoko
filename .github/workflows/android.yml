@@ -64,7 +64,7 @@ jobs:
 
           inline void LiveOnInit(RaceConfig *config, void * /* arg */) {
               auto &scenario = config->raceScenario();
-              scenario.course = Course::GCN_Mario_Circuit;
+              scenario.course = Course::Luigi_Circuit;
               auto &player = scenario.players[0];
               player.character = Character::Mario;
               player.vehicle = Vehicle::Standard_Kart_M;

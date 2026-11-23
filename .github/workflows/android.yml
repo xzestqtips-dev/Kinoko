@@ -44,6 +44,125 @@ jobs:
           }
           #endif
           EOF
+          cat > source/host/KLiveSystem.hh << 'EOF'
+          #pragma once
+
+          #include "host/KSystem.hh"
+          #include "host/SceneCreatorDynamic.hh"
+
+          #include <egg/core/SceneManager.hh>
+
+          #include <game/kart/KartObjectManager.hh>
+          #include <game/system/KPadDirector.hh>
+          #include <game/system/RaceConfig.hh>
+          #include <game/system/RaceManager.hh>
+
+          #include <cstdio>
+          #include <cstdlib>
+
+          namespace Kinoko::System {
+
+          inline void LiveOnInit(RaceConfig *config, void * /* arg */) {
+              auto &scenario = config->raceScenario();
+              scenario.course = Course::GCN_Mario_Circuit;
+              auto &player = scenario.players[0];
+              player.character = Character::Mario;
+              player.vehicle = Vehicle::Standard_Kart_M;
+              player.type = RaceConfig::Player::Type::Local;
+              player.driftIsAuto = false;
+          }
+
+          } // namespace Kinoko::System
+
+          namespace Kinoko {
+
+          /// Live-input test system: drives player 0 with scripted inputs and prints its state.
+          class KLiveSystem : public KSystem {
+          public:
+              KLiveSystem() : m_sceneMgr(nullptr), m_frames(1800) {}
+              ~KLiveSystem() override {
+                  if (s_instance) {
+                      s_instance = nullptr;
+                  }
+              }
+
+              void init() override {
+                  auto *sceneCreator = EGG::egg_new<Host::SceneCreatorDynamic>();
+                  m_sceneMgr = EGG::egg_new<EGG::SceneManager>(sceneCreator);
+                  System::RaceConfig::RegisterInitCallback(System::LiveOnInit, nullptr);
+                  m_sceneMgr->changeScene(0);
+              }
+
+              void calc() override {
+                  m_sceneMgr->calc();
+              }
+
+              bool run() override {
+                  for (u32 f = 0; f < m_frames; ++f) {
+                      System::KPadHostController *pad = nullptr;
+                      if (auto *dir = System::KPadDirector::Instance()) {
+                          pad = dir->hostController();
+                      }
+                      if (pad) {
+                          f32 steer = (f >= 800 && f < 920) ? 0.6f : 0.0f;
+                          if (!pad->setInputs(0x1, steer, 0.0f, System::Trick::None)) {
+                              std::printf("frame %u: inputs rejected as invalid\n", f);
+                          }
+                      }
+                      calc();
+                      if (f % 60 == 0) {
+                          report(f);
+                      }
+                  }
+                  return true;
+              }
+
+              void parseOptions(int argc, char **argv) override {
+                  if (argc >= 1) {
+                      m_frames = static_cast<u32>(std::atoi(argv[0]));
+                  }
+              }
+
+              static KLiveSystem *CreateInstance() {
+                  s_instance = EGG::egg_new<KLiveSystem>();
+                  return static_cast<KLiveSystem *>(s_instance);
+              }
+
+          private:
+              void report(u32 f) const {
+                  auto *raceMgr = System::RaceManager::Instance();
+                  auto *kartMgr = Kart::KartObjectManager::Instance();
+                  if (!raceMgr || !kartMgr) {
+                      std::printf("frame %u: no race yet\n", f);
+                      return;
+                  }
+                  const auto *kart = kartMgr->object(0);
+                  const auto &p = kart->pos();
+                  std::printf("frame %u stage %d pos %.1f %.1f %.1f speed %.2f\n", f,
+                          static_cast<int>(raceMgr->stage()), p.x, p.y, p.z, kart->speed());
+                  std::fflush(stdout);
+              }
+
+              EGG::SceneManager *m_sceneMgr;
+              u32 m_frames;
+          };
+
+          } // namespace Kinoko
+          EOF
+          python3 - << 'EOF'
+          p = 'source/host/main.cc'
+          s = open(p).read()
+          a = '#include "host/KReplaySystem.hh"\n'
+          assert a in s, "include line not found"
+          s = s.replace(a, a + '#include "host/KLiveSystem.hh"\n', 1)
+          b = 'std::array<ModeEntry, 2>'
+          assert b in s, "mode array not found"
+          s = s.replace(b, 'std::array<ModeEntry, 3>', 1)
+          c = '{"replay", []() -> KSystem * { return KReplaySystem::CreateInstance(); }},\n'
+          assert c in s, "replay entry not found"
+          s = s.replace(c, c + '        {"live", []() -> KSystem * { return KLiveSystem::CreateInstance(); }},\n', 1)
+          open(p, 'w').write(s)
+          EOF
       - name: Build
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"

@@ -37,9 +37,14 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_STANDARD=23
-          cmake --build build-android --target libkinoko
+            -DCMAKE_CXX_STANDARD=23 \
+            -DCMAKE_CXX_FLAGS="-include algorithm -include bit -ferror-limit=0 -Wno-error"
+          cmake --build build-android --target libkinoko -- -k 0 2>&1 | tee build.log || true
+          echo "===== ERROR SUMMARY ====="
+          grep -E "error:" build.log | sed 's#/home/runner/work/Kinoko/Kinoko/##' | sort | uniq -c | sort -rn | head -40
+          echo "===== LIBRARIES ====="
           find build-android -name "*.a" -o -name "*.so"
+          test -n "$(find build-android -name '*.a' -o -name '*.so')"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

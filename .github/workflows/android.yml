@@ -98,14 +98,32 @@ jobs:
               }
 
               bool run() override {
+                  bool loggedSteer = false;
+                  u32 rejected = 0;
                   for (u32 f = 0; f < m_frames; ++f) {
                       System::KPadHostController *pad = nullptr;
                       if (auto *dir = System::KPadDirector::Instance()) {
                           pad = dir->hostController();
                       }
                       if (pad) {
-                          f32 steer = (f >= 800 && f < 920) ? 0.6f : 0.0f;
-                          if (!pad->setInputs(0x1, steer, 0.0f, System::Trick::None)) {
+                          bool ok = false;
+                          if (f >= 600 && f < 720) {
+                              // Steer right. Try several stick values, use the first accepted one.
+                              static const f32 tries[] = {4.0f / 7.0f, 0.5f, 3.0f / 7.0f, 1.0f, 0.6f};
+                              for (f32 t : tries) {
+                                  if (pad->setInputs(0x1, t, 0.0f, System::Trick::None)) {
+                                      ok = true;
+                                      if (!loggedSteer) {
+                                          std::printf("frame %u: stick %.4f accepted\n", f, t);
+                                          loggedSteer = true;
+                                      }
+                                      break;
+                                  }
+                              }
+                          } else {
+                              ok = pad->setInputs(0x1, 0.0f, 0.0f, System::Trick::None);
+                          }
+                          if (!ok && rejected++ < 5) {
                               std::printf("frame %u: inputs rejected as invalid\n", f);
                           }
                       }

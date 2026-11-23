@@ -53,7 +53,7 @@ jobs:
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_STANDARD=23 \
-            -DCMAKE_CXX_FLAGS="-include algorithm -include bit -include sstream -include $GITHUB_WORKSPACE/compat_android.hh -ferror-limit=0 -Wno-error -Wno-unknown-warning-option"
+            -DCMAKE_CXX_FLAGS="-include algorithm -include bit -include sstream -include $GITHUB_WORKSPACE/compat_android.hh -ffp-contract=off -fno-math-errno -fno-trapping-math -ferror-limit=0 -Wno-error -Wno-unknown-warning-option"
           cmake --build build-android -- -k 0 2>&1 | tee build.log || true
           echo "===== ERROR SUMMARY ====="
           grep -E "error:|undefined|multiple" build.log | sed 's#/home/runner/work/Kinoko/Kinoko/##' | sort | uniq -c | sort -rn | head -40

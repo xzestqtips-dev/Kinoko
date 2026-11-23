@@ -1,0 +1,453 @@
+name: Kinoko Godot plugin
+on: workflow_dispatch
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Patch Kinoko and add bridge
+        run: |
+          sed -i '1i #include <algorithm>' source/egg/math/Quat.hh
+          grep -rl -- '-Werror' configure.py CMakeLists.txt 2>/dev/null | xargs -r sed -i 's/-Werror//g'
+          cat > "$GITHUB_WORKSPACE/compat_android.hh" << 'KEOF'
+          #pragma once
+          #include <version>
+          #include <cstddef>
+          #include <iterator>
+          #include <ranges>
+          #include <tuple>
+          #include <type_traits>
+          #include <utility>
+          #ifndef __cpp_lib_ranges_enumerate
+          namespace std::ranges::views {
+          template <class R>
+          struct enumerate_compat_view {
+              R m_range;
+              struct iterator {
+                  using It = decltype(std::begin(std::declval<std::remove_reference_t<R> &>()));
+                  It it;
+                  std::ptrdiff_t i;
+                  auto operator*() const {
+                      return std::tuple<std::ptrdiff_t, decltype(*std::declval<It &>())>(i, *it);
+                  }
+                  iterator &operator++() { ++it; ++i; return *this; }
+                  bool operator!=(const iterator &o) const { return it != o.it; }
+              };
+              auto begin() { return iterator{std::begin(m_range), 0}; }
+              auto end() { return iterator{std::end(m_range), 0}; }
+          };
+          template <class R>
+          auto enumerate(R &&r) { return enumerate_compat_view<R>{std::forward<R>(r)}; }
+          }
+          #endif
+          KEOF
+          cat > "source/host/kinoko_c.h" << 'KEOF'
+          #pragma once
+          // Plain C interface to Kinoko. Used by the Godot plugin so that Kinoko's headers
+          // never mix with Godot's.
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          // Starts a live race. dataDir is the folder that contains Kinoko's "Race" folder.
+          // Returns 0 on success, nonzero on failure. Only one race per app run for now.
+          int kinoko_start(const char *dataDir, int course, int character, int vehicle);
+
+          // Runs one frame (1/60 s). buttons: 0x01 accelerate, 0x02 brake/drift, 0x04 item.
+          // stickX / stickY are integers from -7 to 7 (7 = full right / full up).
+          // Returns 1 if the inputs were valid, 0 if not.
+          int kinoko_step(unsigned int buttons, int stickX, int stickY);
+
+          // Fills out[0..13]:
+          // 0-2 position, 3-6 rotation quaternion (x y z w), 7-9 velocity, 10 speed,
+          // 11 race stage (0 intro, 1 countdown, 2 racing, 3/4 finished),
+          // 12 race completion (laps as a fraction, e.g. 1.5), 13 frame counter.
+          // Returns 1 if a race is running, 0 otherwise.
+          int kinoko_state(float *out);
+
+          #ifdef __cplusplus
+          }
+          #endif
+          KEOF
+          cat > "source/host/KBridge.cc" << 'KEOF'
+          #include "host/KSystem.hh"
+          #include "host/Option.hh"
+          #include "host/SceneCreatorDynamic.hh"
+
+          #include <egg/core/ExpHeap.hh>
+          #include <egg/core/SceneManager.hh>
+
+          #include <game/kart/KartObjectManager.hh>
+          #include <game/system/KPadDirector.hh>
+          #include <game/system/RaceConfig.hh>
+          #include <game/system/RaceManager.hh>
+
+          #include <cstdint>
+          #include <cstdlib>
+
+          #include <unistd.h>
+
+          extern "C" {
+          #include "kinoko_c.h"
+          }
+
+          using namespace Kinoko;
+
+          namespace {
+
+          #if defined(__arm64__) || defined(__aarch64__)
+          void FlushDenormalsToZero() {
+              uint64_t fpcr;
+              asm("mrs %0,   fpcr" : "=r"(fpcr));
+              asm("msr fpcr, %0" ::"r"(fpcr | (1 << 24)));
+          }
+          #elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+          #include <immintrin.h>
+          void FlushDenormalsToZero() {
+              _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+          }
+          #else
+          void FlushDenormalsToZero() {}
+          #endif
+
+          int s_course = 8;
+          int s_character = 0;
+          int s_vehicle = 1;
+          bool s_started = false;
+          EGG::SceneManager *s_sceneMgr = nullptr;
+
+          void OnInit(Kinoko::System::RaceConfig *config, void * /* arg */) {
+              auto &scenario = config->raceScenario();
+              scenario.course = static_cast<Course>(s_course);
+              auto &player = scenario.players[0];
+              player.character = static_cast<Character>(s_character);
+              player.vehicle = static_cast<Vehicle>(s_vehicle);
+              player.type = Kinoko::System::RaceConfig::Player::Type::Local;
+              player.driftIsAuto = false;
+          }
+
+          void InitMemory() {
+              void *space = malloc(MEMORY_SPACE_SIZE);
+              EGG::Heap *root = EGG::ExpHeap::create(space, MEMORY_SPACE_SIZE, DEFAULT_OPT);
+              root->setName("EGGRoot");
+              root->becomeCurrentHeap();
+              EGG::SceneManager::SetRootHeap(root);
+          }
+
+          } // namespace
+
+          extern "C" {
+
+          int kinoko_start(const char *dataDir, int course, int character, int vehicle) {
+              if (s_started) {
+                  return 1;
+              }
+              if (dataDir && chdir(dataDir) != 0) {
+                  return 2;
+              }
+
+              s_course = course;
+              s_character = character;
+              s_vehicle = vehicle;
+
+              FlushDenormalsToZero();
+              InitMemory();
+
+              auto *sceneCreator = EGG::egg_new<Kinoko::Host::SceneCreatorDynamic>();
+              s_sceneMgr = EGG::egg_new<EGG::SceneManager>(sceneCreator);
+              Kinoko::System::RaceConfig::RegisterInitCallback(OnInit, nullptr);
+              s_sceneMgr->changeScene(0);
+
+              s_started = true;
+              return 0;
+          }
+
+          int kinoko_step(unsigned int buttons, int stickX, int stickY) {
+              if (!s_started) {
+                  return 0;
+              }
+
+              // This runs on whichever thread calls it, and the setting is per thread.
+              FlushDenormalsToZero();
+
+              if (stickX < -7) stickX = -7;
+              if (stickX > 7) stickX = 7;
+              if (stickY < -7) stickY = -7;
+              if (stickY > 7) stickY = 7;
+
+              bool ok = true;
+              if (auto *dir = Kinoko::System::KPadDirector::Instance()) {
+                  if (auto *pad = dir->hostController()) {
+                      ok = pad->setInputsRawStickZeroCenter(static_cast<u16>(buttons & 0x7),
+                              static_cast<s8>(stickX), static_cast<s8>(stickY),
+                              Kinoko::System::Trick::None);
+                  }
+              }
+
+              s_sceneMgr->calc();
+              return ok ? 1 : 0;
+          }
+
+          int kinoko_state(float *out) {
+              if (!s_started || !out) {
+                  return 0;
+              }
+
+              auto *raceMgr = Kinoko::System::RaceManager::Instance();
+              auto *kartMgr = Kinoko::Kart::KartObjectManager::Instance();
+              if (!raceMgr || !kartMgr) {
+                  return 0;
+              }
+
+              const auto *kart = kartMgr->object(0);
+              const auto &p = kart->pos();
+              const auto &q = kart->fullRot();
+              const auto &v = kart->velocity();
+
+              out[0] = p.x;
+              out[1] = p.y;
+              out[2] = p.z;
+              out[3] = q.v.x;
+              out[4] = q.v.y;
+              out[5] = q.v.z;
+              out[6] = q.w;
+              out[7] = v.x;
+              out[8] = v.y;
+              out[9] = v.z;
+              out[10] = kart->speed();
+              out[11] = static_cast<float>(static_cast<int>(raceMgr->stage()));
+              out[12] = raceMgr->player().raceCompletion();
+              out[13] = static_cast<float>(raceMgr->timerManager().frameCounter());
+              return 1;
+          }
+
+          } // extern "C"
+          KEOF
+      - name: Build libkinoko (Android arm64, position independent)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_CXX_STANDARD=23 \
+            -DCMAKE_CXX_FLAGS="-include algorithm -include bit -include sstream -include $GITHUB_WORKSPACE/compat_android.hh -ffp-contract=off -fno-math-errno -fno-trapping-math -ferror-limit=0 -Wno-error -Wno-unknown-warning-option"
+          cmake --build build-android --target libkinoko -- -k 0 2>&1 | tee build.log || true
+          echo "===== ERROR SUMMARY ====="
+          grep -E "error:|undefined|multiple" build.log | sed 's#/home/runner/work/Kinoko/Kinoko/##' | sort | uniq -c | sort -rn | head -40
+          echo "===== RESULT ====="
+          find build-android -name "*.a"
+          test -f build-android/liblibkinoko.a
+      - name: Build Godot plugin
+        run: |
+          pip install --break-system-packages scons
+          GD="$RUNNER_TEMP/gd"
+          mkdir -p "$GD/src" "$GD/out"
+          cat > "$GD/src/kinoko_c.h" << 'KEOF'
+          #pragma once
+          // Plain C interface to Kinoko. Used by the Godot plugin so that Kinoko's headers
+          // never mix with Godot's.
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          // Starts a live race. dataDir is the folder that contains Kinoko's "Race" folder.
+          // Returns 0 on success, nonzero on failure. Only one race per app run for now.
+          int kinoko_start(const char *dataDir, int course, int character, int vehicle);
+
+          // Runs one frame (1/60 s). buttons: 0x01 accelerate, 0x02 brake/drift, 0x04 item.
+          // stickX / stickY are integers from -7 to 7 (7 = full right / full up).
+          // Returns 1 if the inputs were valid, 0 if not.
+          int kinoko_step(unsigned int buttons, int stickX, int stickY);
+
+          // Fills out[0..13]:
+          // 0-2 position, 3-6 rotation quaternion (x y z w), 7-9 velocity, 10 speed,
+          // 11 race stage (0 intro, 1 countdown, 2 racing, 3/4 finished),
+          // 12 race completion (laps as a fraction, e.g. 1.5), 13 frame counter.
+          // Returns 1 if a race is running, 0 otherwise.
+          int kinoko_state(float *out);
+
+          #ifdef __cplusplus
+          }
+          #endif
+          KEOF
+          cat > "$GD/src/kinoko_race.h" << 'KEOF'
+          #pragma once
+
+          #include <godot_cpp/classes/ref_counted.hpp>
+          #include <godot_cpp/variant/packed_float32_array.hpp>
+          #include <godot_cpp/variant/string.hpp>
+
+          namespace godot {
+
+          class KinokoRace : public RefCounted {
+              GDCLASS(KinokoRace, RefCounted)
+
+          protected:
+              static void _bind_methods();
+
+          public:
+              int start(const String &data_dir, int course, int character, int vehicle);
+              int step(int buttons, float steer, float stick_y);
+              PackedFloat32Array get_state();
+          };
+
+          } // namespace godot
+          KEOF
+          cat > "$GD/src/kinoko_race.cpp" << 'KEOF'
+          #include "kinoko_race.h"
+
+          #include "kinoko_c.h"
+
+          #include <godot_cpp/core/class_db.hpp>
+
+          #include <cmath>
+
+          using namespace godot;
+
+          void KinokoRace::_bind_methods() {
+              ClassDB::bind_method(D_METHOD("start", "data_dir", "course", "character", "vehicle"),
+                      &KinokoRace::start);
+              ClassDB::bind_method(D_METHOD("step", "buttons", "steer", "stick_y"), &KinokoRace::step);
+              ClassDB::bind_method(D_METHOD("get_state"), &KinokoRace::get_state);
+          }
+
+          int KinokoRace::start(const String &data_dir, int course, int character, int vehicle) {
+              CharString path = data_dir.utf8();
+              return kinoko_start(path.get_data(), course, character, vehicle);
+          }
+
+          // steer and stick_y are -1.0 to 1.0. They are rounded to the nearest 1/7 step,
+          // which is the only set of values Kinoko accepts.
+          int KinokoRace::step(int buttons, float steer, float stick_y) {
+              int sx = static_cast<int>(std::lround(steer * 7.0f));
+              int sy = static_cast<int>(std::lround(stick_y * 7.0f));
+              return kinoko_step(static_cast<unsigned int>(buttons), sx, sy);
+          }
+
+          PackedFloat32Array KinokoRace::get_state() {
+              float raw[14];
+              PackedFloat32Array out;
+              if (!kinoko_state(raw)) {
+                  return out;
+              }
+              out.resize(14);
+              for (int i = 0; i < 14; ++i) {
+                  out[i] = raw[i];
+              }
+              return out;
+          }
+          KEOF
+          cat > "$GD/src/register_types.cpp" << 'KEOF'
+          #include "kinoko_race.h"
+
+          #include <gdextension_interface.h>
+          #include <godot_cpp/core/class_db.hpp>
+          #include <godot_cpp/core/defs.hpp>
+          #include <godot_cpp/godot.hpp>
+
+          using namespace godot;
+
+          static void initialize_kinoko_module(ModuleInitializationLevel p_level) {
+              if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
+                  return;
+              }
+              GDREGISTER_CLASS(KinokoRace);
+          }
+
+          static void uninitialize_kinoko_module(ModuleInitializationLevel p_level) {
+              if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
+                  return;
+              }
+          }
+
+          extern "C" {
+          GDExtensionBool GDE_EXPORT kinoko_library_init(GDExtensionInterfaceGetProcAddress p_get_proc_address,
+                  const GDExtensionClassLibraryPtr p_library, GDExtensionInitialization *r_initialization) {
+              GDExtensionBinding::InitObject init_obj(p_get_proc_address, p_library, r_initialization);
+
+              init_obj.register_initializer(initialize_kinoko_module);
+              init_obj.register_terminator(uninitialize_kinoko_module);
+              init_obj.set_minimum_library_initialization_level(MODULE_INITIALIZATION_LEVEL_SCENE);
+
+              return init_obj.init();
+          }
+          }
+          KEOF
+          cat > "$GD/SConstruct" << 'KEOF'
+          #!/usr/bin/env python
+          import os
+
+          env = SConscript("godot-cpp/SConstruct")
+
+          env.Append(CPPPATH=["src/"])
+          sources = Glob("src/*.cpp")
+
+          kinoko_lib = os.environ.get("KINOKO_LIB", "liblibkinoko.a")
+          env.Append(LIBS=[File(kinoko_lib)])
+
+          library = env.SharedLibrary(
+              "bin/libkinoko_gd{}{}".format(env["suffix"], env["SHLIBSUFFIX"]),
+              source=sources,
+          )
+          Default(library)
+          KEOF
+          cat > "$GD/out/kinoko.gdextension" << 'KEOF'
+          [configuration]
+          entry_symbol = "kinoko_library_init"
+          compatibility_minimum = "4.1"
+
+          [libraries]
+          android.debug.arm64 = "res://addons/kinoko/libkinoko_gd.android.template_release.arm64.so"
+          android.release.arm64 = "res://addons/kinoko/libkinoko_gd.android.template_release.arm64.so"
+          KEOF
+          cat > "$GD/out/kart_test.gd" << 'KEOF'
+          extends Node3D
+          # Attach to any Node3D. Set Project Settings > Physics > Common > Physics Ticks Per Second to 60.
+          # DATA_DIR must be a folder that contains Kinoko's "Race" folder (the files you extracted).
+
+          const DATA_DIR := "/sdcard/Download/kinoko"
+          const COURSE := 8      # Luigi_Circuit
+          const CHARACTER := 0   # Mario
+          const VEHICLE := 1     # Standard_Kart_M
+
+          var race := KinokoRace.new()
+          var frame := 0
+          var started := false
+
+          func _ready() -> void:
+              var r := race.start(DATA_DIR, COURSE, CHARACTER, VEHICLE)
+              print("kinoko start result: ", r, " (0 = ok)")
+              started = (r == 0)
+
+          func _physics_process(_delta: float) -> void:
+              if not started:
+                  return
+              var steer := Input.get_axis("ui_left", "ui_right")
+              race.step(1, steer, 0.0)  # 1 = accelerate
+              var s := race.get_state()
+              if s.size() == 14 and frame % 60 == 0:
+                  print("frame ", frame, " stage ", s[11], " pos ", Vector3(s[0], s[1], s[2]), " speed ", s[10])
+              frame += 1
+          KEOF
+          cd "$GD"
+          git clone --depth 1 -b godot-4.4-stable https://github.com/godotengine/godot-cpp godot-cpp
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          export KINOKO_LIB="$GITHUB_WORKSPACE/build-android/liblibkinoko.a"
+          scons platform=android arch=arm64 target=template_release android_api_level=26 -j4 2>&1 | tee scons.log
+          echo "===== RESULT ====="
+          ls -la bin
+          cp bin/*.so out/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kinoko-godot-plugin
+          path: |
+            ${{ runner.temp }}/gd/out/*
+            ${{ runner.temp }}/gd/scons.log
+            build.log
